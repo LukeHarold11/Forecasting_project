@@ -21,7 +21,7 @@ The goal is to compare traditional time-series approaches (Auto-ARIMA, AR2) with
 
 ##  Project Report
 You can view the rendered HTML report here:  
-[Forecasting Project Report](https://lukeharold.github.io/projects/Forecasting_project.html)**
+[Forecasting Project Report](https://lukeharold11.github.io/LukeHarold.github.io/projects/Forecasting_project.html)
 
 ## Author
 Luke Harold  
