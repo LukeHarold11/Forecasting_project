@@ -1,0 +1,356 @@
+---
+title: "Comparing Auto-ARIMA to NNAR"
+author: "Luke Harold"
+date: "2025-04-13"
+format:
+  html:
+    self-contained: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+# Set CRAN mirror
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+# Chunk defaults
+knitr::opts_chunk$set(
+  fig.align = "center",
+  cache = TRUE,
+  autodep = TRUE
+)
+
+set.seed(1234)
+
+# Install/load pacman
+if (!requireNamespace("pacman", quietly = TRUE))
+  install.packages("pacman")
+
+pacman::p_load(
+  tidyverse, forecast, tsibble, gridExtra, timetk, tidymodels,
+  ranger, glmnet, zoo, fable, feasts, future.apply, lubridate
+)
+
+# Load your custom functions
+source("scripts/Forecasting_functions.R", local = knitr::knit_global())
+```
+# Introduction
+The goal of this assignment was to build a model to forecast the unemployment rate for
+an assigned U.S. state, in this case, Maryland. The training window ranged from 1980 to
+December 2012, with the goal of producing a recursive forecast from 2013 onward. There
+are several important considerations in constructing an accurate forecasting model. This
+report focuses on comparing traditional time series models using recursive forecasting,
+followed by an attempt to use a Neural Network Autoregression (NNAR) model with an
+adaptive training window to see whether it can outperform the classic models. 
+
+
+
+```{r, echo=FALSE}
+Maryland_unemployment <- read_csv("Data/Maryland_unemployment_rate.csv") %>%
+  arrange(date)  # ensure chronological
+
+# Plot raw unemployment rate
+Maryland_unemployment %>%
+  ggplot(aes(x = date, y = value)) +
+  geom_line() +
+  labs(title = "Unemployment Rate in Maryland", x = "", y = "Unemployment Rate") +
+  theme_minimal()
+```
+```{r}
+# tsibble
+Maryland <- Maryland_unemployment %>%
+  mutate(date = yearmonth(date)) %>%
+  as_tsibble(index = date)
+
+# base ts (monthly) from NUMERIC vector
+start_year  <- as.integer(format(min(Maryland_unemployment$date), "%Y"))
+start_month <- as.integer(format(min(Maryland_unemployment$date), "%m"))
+
+vals <- dplyr::pull(Maryland_unemployment, value)
+
+# Optional: warn if log() will break
+if (any(vals <= 0, na.rm = TRUE)) {
+  warning("Non-positive values detected; log() will produce -Inf/NA.")
+}
+
+Maryland_ts <- ts(log(vals), start = c(start_year, start_month), frequency = 12)
+```
+
+Visualy the data exhibits a few key features including cylclicallity, seasnality and a downward trend, as well as non-stationarity. In order to combat this we can apply a log transformation to stabilize the variance and then decompose the series to better understand its components. By applying a log transformation, we can stabilize the variance and make the series more stationary, which is often a prerequisite for many time series forecasting methods. As we will be using Auto Arima to choose a model to compare with the Neural Network Autoregression (NNAR) model, we won't pre-difference the data.
+
+```{r, echo=FALSE}
+#apply log transformation and plot the data
+Maryland_ts_log <- Maryland %>%
+  mutate(log_value = log(value))
+Maryland_ts_log %>%
+  ggplot(aes(x = date, y = log_value)) +
+  geom_line() +
+  labs(title = "Log Transformed Unemployment Rate in Maryland",
+       x = "", y = "Log(Unemployment Rate)") +
+  theme_minimal()
+```
+
+Given that the there is seasonality in the data, it is interested to visualize whether this component remains constant over time or if these trends change. With an individual state's unemployment rate it is possible that between 1980-2024 the industry composition of the state has changed, which could lead to changes in seasonal patterns. To investigate this we can decompose the time series into its components. 
+
+```{r, echo=FALSE}
+#decomposing the series
+dcmp<-Maryland_ts_log %>%
+  model(STL(log_value))
+components(dcmp) %>%
+  autoplot() +
+  labs(title = "STL Decomposition of Log Transformed Unemployment Rate in Maryland",
+       x = "", y = "Log(Unemployment Rate)") +
+  theme_minimal()
+```
+
+Here we can see that the seasonal component has some change across the years.
+
+```{r, echo=FALSE}
+#fitting models
+maryland_train <- Maryland_ts_log %>%
+  filter_index("1980 Jan" ~ "2012 Dec") %>%
+  rename(log_unemploy = log_value)
+fit <- maryland_train %>%
+  model(
+    AR2 = ARIMA(log_unemploy ~ pdq(2,1,0)),
+    auto = ARIMA(log_unemploy, stepwise = FALSE, approx = FALSE)
+  )
+fit %>%  pivot_longer(everything(), names_to = "Model name",
+                    values_to = "Orders")
+glance(fit) %>%  
+  arrange(AICc) %>% 
+  select(.model:BIC)
+```
+
+We start with a model chosen by auto.arima and an AR2 model that we will compare to the NNAR models later in the analysis.
+
+
+```{r model_run, echo=FALSE, cache=TRUE}
+knitr::opts_current$set(
+  dependson   = "data",
+  cache.extra = list(file.mtime("scripts/Forecasting_functions.R"),
+                     file.mtime("Data/Maryland_unemployment_rate.csv"),
+                     1234)
+)
+
+auto_arima <- function(x) {
+  Arima(x, order = c(2,0,2),
+        seasonal = list(order = c(0,1,2), period = frequency(x)),
+        include.mean = FALSE)
+}
+
+AR2 <- function(x) {
+  Arima(x, order = c(2,1,0),
+        seasonal = list(order = c(0,1,1), period = frequency(x)),
+        include.mean = FALSE)
+}
+
+
+#function that applies recursive forecasting to multiple models, see scripts/Forecasting_functions.R for details
+#start <- Sys.time()
+res2 <- recursive_forecast_multi(Maryland_ts,
+                                 start_train = c(1980,1),
+                                 end_train   = c(2012,12),
+                                 model_funs  = list(forecast::naive, auto_arima, AR2),
+                                 names       = c("Naive", "autoARIMA", "AR2"),
+                                 h = 1)
+#end <- Sys.time(); end - start
+#calculate the rmse
+res2<-res2 %>%
+  mutate(
+    Actual_level = exp(Actual),
+    Auto_level   = exp(autoARIMA),
+    AR2_level    = exp(AR2),
+    Auto_fit     = Actual_level - Auto_level,
+    AR2_fit      = Actual_level - AR2_level,
+    
+  )
+#calcualte rmse
+rmse_AR2 <- sqrt(mean(res2$AR2_fit^2))
+rmse_auto <- sqrt(mean(res2$Auto_fit^2))
+performance<-cbind(rmse_AR2, rmse_auto)
+performance
+#rm(performance)
+```
+
+```{r, echo=FALSE}
+#attach the level scale forecasts to the original data for plotting
+autoplot(ts(res2[,c("Actual_level","Auto_level","AR2_level")], start=c(2013,1), frequency=12)) +
+  labs(title = "Recursive 1-step forecasts from Auto ARIMA and AR2 models",
+       x = "Year", y = "Unemployment Rate") +
+  theme_minimal()
+
+```
+
+Comparing the two models we see that the auto arima model has a lower rmse than the AR2 model, but visually we can see that both struggle greatly to capture the spike in unemployment during the covid period. Is there potentially a model that can better capture these structural breaks and changing seasonal patterns? Neural Network Auto-regression (NNAR) is a forecasting method that uses a feed-forward neural network to model the relationship between past values of a time series and its future values. It is used for its ability to capture complex patterns in the data and is not constrained by the assumptions of traditional time series models.
+
+
+
+Neural Network Auto-regression uses several parameters including the number of lagged inputs(p), the number of seasonal lagged inputs (P), the number of nodes in the hidden layer (size), and the number of times to repeat the fitting process with different random starting weights (repeats). These parameters can be changed to see which combination fits the data best. Here we train a NNAR on the training window to find the best structure, which we will then use in the recursive forecast allowing the weights to change but keeping the 5 lags, 1 seasonal lag and 4 hidden nodes. 
+
+```{r, echo=FALSE}
+set.seed(1234)
+train0 <- window(Maryland_ts, start = c(1980,1), end = c(2012,12))
+fit0   <- forecast::nnetar(train0)
+fit0
+```
+Here we see that it outperforms the arima models from earlier. 
+
+```{r nnar_fixed_run, include=FALSE, cache=TRUE}
+knitr::opts_current$set(
+  dependson   = "data",  # <- the label of your data chunk
+  cache.extra = list(
+    file.mtime("scripts/Forecasting_functions.R"),
+    file.mtime("Data/Maryland_unemployment_rate.csv"),
+    1234
+  )
+)
+#1
+train0 <- stats::window(Maryland_ts, start = c(1980,1), end = c(2012,12))
+fit0   <- forecast::nnetar(train0)
+fit0
+
+# 2) Wrap those choices; this function will be called at each step
+my_nnar_fixed <- function(x) {
+  forecast::nnetar(x, p = fit0$p, P = fit0$P, size = fit0$size, repeats = 20)
+}
+start <- Sys.time()
+nnforecast <- recursive_forecast_multi(
+  Maryland_ts,
+  start_train = c(1980,1),
+  end_train   = c(2012,12),
+  model_funs  = list(my_nnar_fixed),
+  names       = "NNAR_fixed",
+  h = 1
+)
+end <- Sys.time(); end - start
+
+
+nnforecast <- nnforecast %>%
+  mutate(
+    Actual_level = exp(Actual),
+    NNAR_fixed_level   = exp(NNAR_fixed),
+    NNAR_fit     = Actual_level - NNAR_fixed_level
+  )
+rmse_nnar <- sqrt(mean(nnforecast$NNAR_fit^2))
+rmse_nnar
+```
+
+```{r echo=FALSE}
+#add rmse_nnar to performance table
+performance<-cbind(performance, rmse_nnar)
+performance
+```
+
+We also will fit models allowing the NNAR to change for each forecast of the data and with a dynamic window. The dynamic window uses a NNAR with the same structure as above but allows the training window to grow with each step, starting with a minimum of 3 years and increasing by 1 year at each step. This allows the weights to change and the window to change based on the length of the window that produced the most accurate forecast in the previous step. For t+1, the window that produced the smallest error for t is used to produce the forecast for t+1 and so forth. The idea here is that in uncertain times like covid, using lots of historical data may not actually be helpful in producing accurate forecasts. 
+
+
+
+```{r nnar_dynamic, echo=FALSE, cache=TRUE}
+knitr::opts_current$set(
+  dependson   = "data",  # <- the label of your data chunk
+  cache.extra = list(
+    file.mtime("scripts/Forecasting_functions.R"),
+    file.mtime("Data/Maryland_unemployment_rate.csv"),
+    1234
+  )
+)
+# 2) Run dynamic-window NNAR (1-year window steps, min 3y, no max cap)
+start <- Sys.time()
+res_dyn <- dynamic_nnar_greedy(
+  ts_data     = Maryland_ts,         # your LOG series, if that's what you're using
+  start_train = c(1980,1),
+  end_train   = c(2012,12),
+  p = 5, P = 1, size = 4, repeats = 20,
+  h = 1,
+  min_years   = 3,
+  step_years  = 1,
+  max_years   = NULL,
+  lambda      = NULL,                # keep NULL if input is already logged
+  name        = "NNAR_dyn"
+)
+end <- Sys.time(); end - start
+
+res_dyn <- res_dyn %>%
+  mutate(
+    Actual_level = exp(Actual),
+    NNAR_dyn_level   = exp(NNAR_dyn),
+    NNAR_dyn_fit     = Actual_level - NNAR_dyn_level
+  )
+res_dyn<-res_dyn %>% 
+  select(-time)
+rmse_nnar_dyn <- sqrt(mean(res_dyn$NNAR_dyn_fit^2))
+rmse_nnar_dyn
+performance<-cbind(performance, rmse_nnar_dyn)
+performance
+```
+
+
+
+```{r, echo=FALSE}
+#attach all three NNAR forecasts to the original data for plotting
+#res_dyn, nnforecast, nn_adapt_forecast, attach by actual
+if (exists("all_nnar")) rm(all_nnar)
+
+all_forecasts <- dplyr::bind_cols(
+  res2              %>% dplyr::select(Auto_level,AR2_level),
+  nnforecast        %>% dplyr::select(Actual_level, NNAR_fixed_level),
+  res_dyn           %>% dplyr::select(NNAR_dyn_level)
+)
+#make all_nnar into a ts
+all_nnar <- ts(all_forecasts, start = c(2013,1), frequency = 12)
+autoplot(ts(all_nnar[, c("Actual_level","NNAR_fixed_level", "NNAR_dyn_level")],
+            start = c(2013,1), frequency = 12)) +
+  labs(title = "Recursive 1-step forecasts from NNAR models",
+       x = "Year", y = "Unemployment Rate") +
+  theme_minimal()
+
+```
+We see that only the NNAR that was fit on the entire training window outperforms the auto arima model and AR2 model across the entire series.
+
+```{r, echo=FALSE}
+#pretty table showing the rmse for all models
+
+performance %>%
+  knitr::kable(caption = "RMSE for all models")
+```
+How do the models compare specifically during the covid period? From the results we see that the NNAR model that was fit on the training data that keeps the same structure throughout performs the best.
+
+```{r, echo=FALSE}
+# 0) Sanity check: same length for all forecast tables
+stopifnot(
+  nrow(res2) == nrow(nnforecast),
+  nrow(nnforecast) == nrow(res_dyn)
+)
+
+# 1) Bind with one Actual column + all forecast columns
+all_forecasts <- dplyr::bind_cols(
+  nnforecast        %>% dplyr::select(Actual_level, NNAR_fixed_level),
+  res_dyn           %>% dplyr::select(NNAR_dyn_level),
+  res2              %>% dplyr::select(Auto_level, AR2_level)
+)
+
+# 2) Add a monthly index (your recursive period starts at 2013-01)
+all_forecasts <- all_forecasts %>%
+  mutate(t = seq(as.yearmon("2013-01"), by = 1/12, length.out = n()))
+
+# 3) Filter the window and compute RMSEs vs Actual_level
+slice_20_21 <- all_forecasts %>%
+  filter(t >= as.yearmon("2020-01"), t <= as.yearmon("2021-01"))
+
+rmse_2020_2021 <- slice_20_21 %>%
+  summarise(
+    NNAR_fixed = sqrt(mean((NNAR_fixed_level - Actual_level)^2, na.rm = TRUE)),
+    NNAR_dyn   = sqrt(mean((NNAR_dyn_level   - Actual_level)^2, na.rm = TRUE)),
+    autoARIMA  = sqrt(mean((Auto_level       - Actual_level)^2, na.rm = TRUE)),
+    AR2        = sqrt(mean((AR2_level        - Actual_level)^2, na.rm = TRUE))
+  ) %>%
+  tidyr::pivot_longer(everything(), names_to = "model", values_to = "RMSE")
+
+rmse_2020_2021
+```
+
+
+From this analysis we see that NNAR can be used to effectively forecast univariate time series data and the fixed model outperformed the arima models along with the adaptive and dynamic models.
